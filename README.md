@@ -1,6 +1,6 @@
 # Quest VD Wired Watchdog
 
-Quest 3 の有線接続を維持するスクリプトです。[Quest VD Wired](https://github.com/kkoemets/quest-vd-wired) の
+Quest の有線接続を維持するスクリプトです。[Quest VD Wired](https://github.com/kkoemets/quest-vd-wired) の
 リンクが切れたことを検知し、自動で復旧させます。
 
 Quest VD Wired 単体では、**HMD の電源を切って入れ直すと接続が戻りません。**
