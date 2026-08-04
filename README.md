@@ -14,6 +14,7 @@ Virtual Desktop を起動して繋がらない場合は、少し待ってから 
 
 > **非公式のスクリプトです。** Meta、Virtual Desktop、Genymobile、Quest VD Wired プロジェクトの
 > いずれとも関係ありません。
+> AIに頼んだらできたので、デバッグを頑張って問題ないレベルまで仕上げました。
 
 ---
 
