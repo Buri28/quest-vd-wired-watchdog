@@ -1,10 +1,10 @@
 # Quest VD Wired Watchdog
 
-[Quest VD Wired](https://github.com/kkoemets/quest-vd-wired) を使用するとQuestとVirtualDesktopをUSBで有線接続できますが
-Quest VD Wired 単体では、**HMD の電源を切って入れ直すと接続が戻りません。**
-毎回タスクトレイを開いて **Diagnose and fix** を押す必要があります。
-このスクリプトはその手間をなくし、リンクが切れたことを検知し、自動で復旧させます。
+[Quest VD Wired](https://github.com/kkoemets/quest-vd-wired) を使用するとQuestとVirtualDesktopをUSBで有線接続できますが  
+Quest VD Wired 単体では、**HMD の電源を切って入れ直すと接続が戻りません。**  
+毎回タスクトレイを開いて **Diagnose and fix** を押す必要があります。  
 
+このスクリプトはその手間をなくし、リンクが切れたことを検知し、自動で復旧させます。
 **これにより、PC に一切さわらずに HMD 側から接続できるようになります。**
 
 HMD を起動した後は Quest VD Wired を再起動する時間が必要です。
