@@ -1,3 +1,6 @@
+**Virtual Desktopのβ版が有線接続に対応したみたいです。(2026/08/06)**
+
+----
 # Quest VD Wired Watchdog
 
 [Quest VD Wired](https://github.com/kkoemets/quest-vd-wired) を使用するとQuestとVirtualDesktopをUSBで有線接続できますが  
