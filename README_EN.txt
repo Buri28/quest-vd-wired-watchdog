@@ -157,14 +157,29 @@ choose Exit, then run install.cmd again.
  How it works
 ------------------------------------------------------------------------
 
-It uses adb to check whether a tun interface exists on the headset.
-If it does, the VPN is established and the link is alive.
+The link is considered alive only when all three conditions hold:
+
+  1. A tun interface exists on the headset
+  2. quest-vd-wired.exe is running on the PC
+  3. adb reverse mappings are in place
 
   - Headset not listed by "adb devices"
       -> cable or power problem. Wait, do nothing.
 
-  - Headset listed but no tun interface
+  - Headset listed but any of the three conditions is missing
       -> restart quest-vd-wired.exe
+
+If either app is simply not running, the restart happens immediately
+instead of waiting for three consecutive failures. An app that is not
+running is a definitive failure, not a transient blip like a marginal
+cable. This covers the moments right after a PC reboot and right after
+the headset is powered back on; both recover within a few seconds.
+
+Checking for the tun interface alone is not enough. If the PC reboots while
+the headset stays on, the VPN on the Quest side survives and the tun
+interface remains, but on the PC there is neither a host process nor any
+adb reverse mapping. The PC-side conditions exist so that this hollow state
+is not mistaken for a healthy link.
 
 Nothing is restarted while the link is healthy.
 

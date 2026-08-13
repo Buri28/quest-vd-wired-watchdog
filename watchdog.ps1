@@ -3,9 +3,15 @@
     Quest VD Wired watchdog - USB リンクが落ちたら自動で復旧させる常駐スクリプト。
 
 .DESCRIPTION
-    Quest 側に tun インターフェースが存在するかを adb で監視し、
-    デバイスは見えているのに tun が無い状態が続いたら quest-vd-wired を起動し直す。
-    HMD の電源 OFF -> ON、スリープ復帰、ケーブル抜き差しからの復帰を自動化する。
+    リンクが生きているかを次の 3 条件で判定し、欠けた状態が続いたら
+    quest-vd-wired を起動し直す。
+
+      1. Quest 側に tun インターフェースがある
+      2. PC 側で quest-vd-wired.exe が動いている
+      3. adb reverse のマッピングが張られている
+
+    HMD の電源 OFF -> ON、スリープ復帰、ケーブル抜き差し、そして
+    PC 側の再起動からの復帰を自動化する。
 
     設定は初回実行時に watchdog.config.json として自動生成される。
     パスが自動検出できなかった場合はそのファイルを編集すること。
@@ -66,11 +72,14 @@ $Defaults = [ordered]@{
     intervalSec       = 10    # 監視間隔
     failThreshold     = 3     # 連続何回異常を見たら再起動するか
     settleSec         = 60    # 再起動後、復帰を待つ上限
-    settlePollSec     = 5     # 復帰待ち中の確認間隔
+    settlePollSec     = 2     # 復帰待ち中の確認間隔
     cmdTimeoutSec     = 10    # adb コマンドが固まったときの打ち切り
     maxRestarts       = 3     # 連続何回まで再起動を試みるか
     giveUpWaitSec     = 600   # 上限に達したあと、次に再起動を試みるまでの待ち時間
 }
+
+# Quest 側クライアントのパッケージ名。Quest VD Wired が導入するもの。
+$AndroidPackage = "com.genymobile.gnirehtet"
 
 # ---- パス自動検出 --------------------------------------------------------
 
@@ -295,16 +304,26 @@ if (-not $acquired) {
     return
 }
 
-$Adb           = $cfg.adbPath
-$Vd            = $cfg.questVdWiredPath
-$LogFile       = $cfg.logPath
-$IntervalSec   = [int]$cfg.intervalSec
-$FailThreshold = [int]$cfg.failThreshold
-$SettleSec     = [int]$cfg.settleSec
-$SettlePollSec = [int]$cfg.settlePollSec
-$CmdTimeoutSec = [int]$cfg.cmdTimeoutSec
-$MaxRestarts   = [int]$cfg.maxRestarts
-$GiveUpWaitSec = [int]$cfg.giveUpWaitSec
+# 数値は下限を設けて取り込む。
+# 0 や非数値をそのまま使うと待ち時間が消えてループが暴走したり、
+# 型変換の例外で (非表示起動だと誰にも見えないまま) 起動に失敗する。
+function Get-IntSetting($Value, [int]$Default, [int]$Min) {
+    $n = $Default
+    try { $n = [int]$Value } catch { $n = $Default }
+    if ($n -lt $Min) { $n = $Min }
+    return $n
+}
+
+$Adb           = [string]$cfg.adbPath
+$Vd            = [string]$cfg.questVdWiredPath
+$LogFile       = [string]$cfg.logPath
+$IntervalSec   = Get-IntSetting $cfg.intervalSec    10  2
+$FailThreshold = Get-IntSetting $cfg.failThreshold   3  1
+$SettleSec     = Get-IntSetting $cfg.settleSec      60  5
+$SettlePollSec = Get-IntSetting $cfg.settlePollSec   2  1
+$CmdTimeoutSec = Get-IntSetting $cfg.cmdTimeoutSec  10  2
+$MaxRestarts   = Get-IntSetting $cfg.maxRestarts     3  1
+$GiveUpWaitSec = Get-IntSetting $cfg.giveUpWaitSec 600 30
 
 $logDir = Split-Path -Parent $LogFile
 if ($logDir -and -not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
@@ -406,9 +425,25 @@ function Wait-Tick([int]$Seconds, [switch]$IgnoreForce) {
     }
 }
 
+# 一時ファイルは専用フォルダに置く。
+# adb は初回呼び出しで常駐サーバーを fork するが、そのサーバーが
+# リダイレクト先のハンドルを継承するため、削除に失敗して残ることがある。
+# 放置すると %TEMP% を埋め尽くし、最終的に GetTempFileName() が例外を投げる。
+$TempDir = Join-Path $env:TEMP "quest-vd-wired-watchdog"
+if (-not (Test-Path $TempDir)) { New-Item -ItemType Directory -Path $TempDir -Force | Out-Null }
+
+# 起動時に前回の残骸を掃除する (使用中のものは失敗するが無視してよい)。
+Get-ChildItem $TempDir -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-5) } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+
+$script:TempSeq = 0
+
 function Invoke-Bounded([string]$Exe, [string[]]$Arguments, [int]$TimeoutSec) {
-    $out = [System.IO.Path]::GetTempFileName()
-    $err = [System.IO.Path]::GetTempFileName()
+    $script:TempSeq++
+    $base = Join-Path $TempDir ("{0}-{1}" -f $PID, $script:TempSeq)
+    $out = "$base.out"
+    $err = "$base.err"
     try {
         $p = Start-Process -FilePath $Exe -ArgumentList $Arguments -PassThru -NoNewWindow `
                            -RedirectStandardOutput $out -RedirectStandardError $err
@@ -433,15 +468,67 @@ function Test-DevicePresent {
     return $false
 }
 
-# VPN が確立しているか。正常時は次の行が出る:
+# Quest 側に VPN インターフェースがあるか。正常時は次の行が出る:
 #   29: tun0    inet 10.0.0.2/32 scope global tun0
-function Test-Tunnel {
+function Test-TunPresent {
     $r = Invoke-Bounded $Adb @("shell", "ip", "-o", "addr") $CmdTimeoutSec
     if ($r.TimedOut) { return $false }
     foreach ($line in ($r.Output -split "`r?`n")) {
         if ($line -match "\btun\d+\b" -and $line -match "\binet\b") { return $true }
     }
     return $false
+}
+
+# Quest 側のクライアントアプリが動いているか。
+# HMD の電源を入れ直すと確実に消える。tun が残るケースと違い、
+# ここが false なら一過性ではない確定的な異常。
+function Test-AndroidAppRunning {
+    $r = Invoke-Bounded $Adb @("shell", "pidof", $AndroidPackage) $CmdTimeoutSec
+    if ($r.TimedOut) { return $true }   # 判定できないときは異常と決めつけない
+
+    # adb サーバーが起動していないとき、adb は PID の前に
+    #   * daemon not running; starting now at tcp:5037
+    #   * daemon started successfully
+    # を標準出力に混ぜてくる。PC 再起動直後がまさにこれなので、
+    # 単純な先頭一致で判定すると「動いていない」と誤判定してしまう。
+    foreach ($line in ($r.Output -split "`r?`n")) {
+        $t = $line.Trim()
+        if ($t -eq "" -or $t.StartsWith("*")) { continue }
+        if ($t -match "^\d+$") { return $true }
+    }
+    return $false
+}
+
+# PC 側のホストプロセスが動いているか。
+function Test-HostRunning {
+    $vdName = Split-Path -Leaf $Vd
+    $p = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+           Where-Object { $_.Name -eq $vdName })
+    return ($p.Count -gt 0)
+}
+
+# adb reverse のマッピングが張られているか。
+# マッピングは adb サーバー内に保持されるので、PC の再起動やホストプロセスの
+# 消失で失われる。読み取りのみで、接続には干渉しない。
+function Test-ReverseMappings {
+    $r = Invoke-Bounded $Adb @("reverse", "--list") $CmdTimeoutSec
+    if ($r.TimedOut) { return $false }
+    foreach ($line in ($r.Output -split "`r?`n")) {
+        if ($line -match "tcp:\d+") { return $true }
+    }
+    return $false
+}
+
+# リンクが本当に生きているか。
+#
+# tun の有無だけでは不十分。HMD を起動したまま PC を再起動すると、Quest 側の
+# VpnService は生き残るため tun0 は残るが、PC 側にはホストプロセスも
+# adb reverse マッピングも存在しない。殻だけが残った状態を「健全」と
+# 誤判定しないよう、PC 側の 2 条件も必ず確認する。
+function Test-Link {
+    if (-not (Test-HostRunning))     { return $false }
+    if (-not (Test-ReverseMappings)) { return $false }
+    return (Test-TunPresent)
 }
 
 # CLI サブコマンドは使わない。プロセスを入れ替えて GUI として起動し直すだけ。
@@ -460,10 +547,15 @@ function Restart-Link {
                 Write-Log ("  stop failed: {0}" -f $_.Exception.Message)
             }
         }
-    Start-Sleep -Seconds 3
+    Start-Sleep -Seconds 1
     Write-Log "starting quest-vd-wired"
     # 本来の場所から起動したときと同じ作業ディレクトリにしておく。
-    Start-Process -FilePath $Vd -WorkingDirectory (Split-Path -Parent $Vd)
+    # exe が消えている / ドライブが外れている場合に例外で常駐ごと死なないよう握る。
+    try {
+        Start-Process -FilePath $Vd -WorkingDirectory (Split-Path -Parent $Vd)
+    } catch {
+        Write-Log ("  start failed: {0}" -f $_.Exception.Message)
+    }
 }
 
 # ---- メインループ --------------------------------------------------------
@@ -482,6 +574,11 @@ try {
     while ($true) {
         if ($script:Quit) { Write-Log "terminated from tray menu"; break }
 
+        # 1 周期のどこかで例外が出ても常駐ごと死なせない。
+        # $ErrorActionPreference = "Stop" のため、adb の一時ファイル生成や
+        # プロセス操作が失敗しただけでループを抜けてしまうのを防ぐ。
+        try {
+
         if (-not (Test-DevicePresent)) {
             # ケーブル接触不良 / HMD 電源 OFF。再起動しても無駄なので待つだけ。
             if ($lastState -ne "no-device") {
@@ -489,11 +586,14 @@ try {
                 $lastState = "no-device"
             }
             Set-Tray "idle" "未接続 - Quest を待機中"
+            # 切断をまたいで再起動回数を持ち越すと、次の障害で 1 度も
+            # 復旧を試みないまま待機に入ってしまう。ここで戻す。
             $failures = 0
+            $restarts = 0
         }
-        elseif (Test-Tunnel) {
+        elseif (Test-Link) {
             if ($lastState -ne "ok") {
-                Write-Log "tun up - link healthy"
+                Write-Log "link healthy"
                 $lastState = "ok"
             }
             Set-Tray "ok" ("接続中 " + (Get-Date -Format "HH:mm:ss"))
@@ -501,8 +601,22 @@ try {
             $restarts = 0
         }
         else {
-            $failures++
-            Write-Log ("tun missing ({0}/{1})" -f $failures, $FailThreshold)
+            # どちらかのアプリがそもそも起動していない場合は待たずに再起動する。
+            # しきい値は USB 接触の一瞬のフラつきを吸収するためのものだが、
+            # 「アプリが動いていない」は一過性の現象ではなく確定的な異常。
+            #   PC 再起動   -> PC 側のホストプロセスが消える
+            #   HMD 電源 ON -> Quest 側のクライアントが消える
+            # ここで待つと 20〜30 秒を無駄にする。
+            if (-not (Test-HostRunning)) {
+                $failures = $FailThreshold
+                Write-Log "host not running - restarting immediately"
+            } elseif (-not (Test-AndroidAppRunning)) {
+                $failures = $FailThreshold
+                Write-Log "android app not running - restarting immediately"
+            } else {
+                $failures++
+                Write-Log ("link down ({0}/{1})" -f $failures, $FailThreshold)
+            }
             Set-Tray "bad" ("切断を検知 ({0}/{1})" -f $failures, $FailThreshold)
             $lastState = "down"
 
@@ -512,6 +626,9 @@ try {
                     Set-Tray "bad" "復旧できず - 手動対応が必要かもしれません"
                     # ここでは「今すぐ再接続」で抜けられるようにしておく (待機の短縮になる)
                     Wait-Tick $GiveUpWaitSec
+                    # 「今すぐ再接続」で待機を抜けた場合、フラグを消さずに
+                    # continue すると次周期で二重に再起動が走る。ここで消費する。
+                    $script:ForceRestart = $false
                     $failures = 0
                     $restarts = 0
                     $lastState = ""
@@ -529,11 +646,11 @@ try {
                 while (((Get-Date) - $t0).TotalSeconds -lt $SettleSec) {
                     Wait-Tick $SettlePollSec -IgnoreForce
                     if ($script:Quit) { break }
-                    if (Test-Tunnel) { $recovered = $true; break }
+                    if (Test-Link) { $recovered = $true; break }
                 }
                 $elapsed = [int]((Get-Date) - $t0).TotalSeconds
                 if ($recovered) {
-                    Write-Log ("tun up - recovered in {0}s" -f $elapsed)
+                    Write-Log ("link healthy - recovered in {0}s" -f $elapsed)
                     $lastState = "ok"
                     $restarts = 0
                 } else {
@@ -541,6 +658,7 @@ try {
                     $lastState = "down"
                 }
                 $failures = 0
+                $script:ForceRestart = $false
                 continue
             }
         }
@@ -557,11 +675,17 @@ try {
             $failures = 0
             $lastState = ""
         }
+
+        } catch {
+            Write-Log ("iteration error: {0}" -f $_.Exception.Message)
+            $lastState = ""
+            Wait-Tick $IntervalSec
+        }
     }
 }
 finally {
     try { $Tray.Visible = $false; $Tray.Dispose() } catch { }
     try { $IconOk.Dispose(); $IconIdle.Dispose(); $IconBad.Dispose() } catch { }
-    $mutex.ReleaseMutex()
-    $mutex.Dispose()
+    try { $mutex.ReleaseMutex() } catch { }
+    try { $mutex.Dispose() } catch { }
 }
