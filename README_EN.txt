@@ -21,7 +21,9 @@ NOTE: This is an unofficial companion tool. It is not affiliated with,
   Headset powered off -> on ....... reconnects automatically
   Headset sleep -> wake ........... reconnects automatically
   Cable unplugged / loose contact .. detects recovery and reconnects
-  While the cable is unplugged ..... waits, does nothing
+  While the cable is unplugged ..... waits, does nothing; after 15 s it
+                                     shows a Windows notification
+  Asleep with USB still plugged in . waits, does nothing
 
 A system tray icon shows both that the watchdog is running and whether
 the link is up.
@@ -83,6 +85,33 @@ Put the real path into questVdWiredPath in watchdog.config.json
 
 
 ------------------------------------------------------------------------
+ Updating
+------------------------------------------------------------------------
+
+* Updating the watchdog
+
+  Extract the new ZIP over the old one and run install.cmd. The running
+  old watchdog is stopped and replaced automatically.
+  watchdog.config.json is kept.
+
+* Updating Quest VD Wired itself
+
+  Each Quest VD Wired version usually lives in its own folder
+  (e.g. quest-vd-wired-v4.1.4-windows-x64 -> quest-vd-wired-v4.1.34-windows-x64).
+
+    1. Extract the watchdog ZIP again into the new Quest VD Wired folder
+    2. Run install.cmd in that folder
+
+  The watchdog running from the old folder is stopped and the autostart
+  entry is switched to the new folder. If the old Quest VD Wired is still
+  running, it is replaced with the new one once the headset is awake.
+
+  Do not copy watchdog.config.json from the old folder. It contains the
+  path to the old quest-vd-wired.exe, so the old version would keep
+  being started.
+
+
+------------------------------------------------------------------------
  Files
 ------------------------------------------------------------------------
 
@@ -113,8 +142,13 @@ A round icon appears next to the clock. If you cannot see it, click the
 "^" arrow and drag the icon into the visible area.
 
   Green ... connected
-  Grey .... not connected (headset not visible over USB)
-  Red ..... disconnection detected / recovering
+  Yellow .. headset not detected over USB (unplugged / loose cable /
+            powered off). The headset is not charging in this state.
+  Grey .... USB connected but the headset is asleep
+
+If the icon stays yellow for 15 seconds, a Windows notification is shown
+(once per disconnection). Another one tells you when USB is back.
+  Red ..... disconnection detected / recovering / more than one USB device
 
 Hover for details. Right-click for:
 
@@ -128,8 +162,13 @@ Hover for details. Right-click for:
  Configuration
 ------------------------------------------------------------------------
 
-Edit watchdog.config.json. To apply changes, right-click the tray icon,
-choose Exit, then run install.cmd again.
+Edit watchdog.config.json. To apply changes, run install.cmd again
+(the running watchdog is replaced automatically).
+
+Paths you write by hand are never overwritten by auto-detection. The one
+exception is the adb bundled with Quest VD Wired (under
+%LOCALAPPDATA%\GnirehtetVD): if an update moves it to a new folder, it is
+detected again automatically.
 
   adbPath            auto      path to adb.exe
   questVdWiredPath   auto      path to quest-vd-wired.exe
@@ -137,10 +176,11 @@ choose Exit, then run install.cmd again.
   intervalSec        10        polling interval, seconds
   failThreshold      3         consecutive failures before restarting
   settleSec          60        max seconds to wait for recovery
-  settlePollSec      5         how often to check during recovery
+  settlePollSec      2         how often to check during recovery
   cmdTimeoutSec      10        adb command timeout, seconds
   maxRestarts        3         consecutive restart attempts allowed
   giveUpWaitSec      600       cool-down after giving up, seconds
+  notifyNoUsbSec     15        notify after this many seconds without USB (0 = off)
 
   logPath default: %LOCALAPPDATA%\GnirehtetVD\watchdog.log
 
@@ -166,8 +206,17 @@ The link is considered alive only when all three conditions hold:
   - Headset not listed by "adb devices"
       -> cable or power problem. Wait, do nothing.
 
+  - Two or more USB devices attached (e.g. a phone)
+      -> wait, do nothing. Quest VD Wired itself cannot pick a device
+         either. Wireless adb and emulators are not counted.
+
+  - Headset listed but asleep
+      -> wait, do nothing. The headset app stops while asleep, so a
+         restart would not reconnect anyway.
+
   - Headset listed but any of the three conditions is missing
       -> restart quest-vd-wired.exe
+         (without creating a console window)
 
 If either app is simply not running, the restart happens immediately
 instead of waiting for three consecutive failures. An app that is not
@@ -190,9 +239,15 @@ Nothing is restarted while the link is healthy.
 
 * No tray icon appears
 
-  Run run_debug.cmd to see the error. If adb.exe or
+  Look for a "startup failed" line in the log
+  (%LOCALAPPDATA%\GnirehtetVD\watchdog.log); it says why. You can also
+  run run_debug.cmd to see the error. If adb.exe or
   quest-vd-wired.exe could not be located, write the paths directly
   into watchdog.config.json.
+
+* The icon is red and says there is more than one USB device
+
+  Unplug any Android device other than the Quest (a phone, etc.).
 
 * It keeps reconnecting over and over
 

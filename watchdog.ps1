@@ -13,6 +13,9 @@
     HMD の電源 OFF -> ON、スリープ復帰、ケーブル抜き差し、そして
     PC 側の再起動からの復帰を自動化する。
 
+    デバイスが見えない間、USB を挿したまま HMD がスリープしている間、
+    USB のデバイスが複数ある間は、再起動しても直らないので何もせず待つ。
+
     設定は初回実行時に watchdog.config.json として自動生成される。
     パスが自動検出できなかった場合はそのファイルを編集すること。
 
@@ -76,6 +79,19 @@ $Defaults = [ordered]@{
     cmdTimeoutSec     = 10    # adb コマンドが固まったときの打ち切り
     maxRestarts       = 3     # 連続何回まで再起動を試みるか
     giveUpWaitSec     = 600   # 上限に達したあと、次に再起動を試みるまでの待ち時間
+    notifyNoUsbSec    = 15    # Quest が USB で見えない状態がこの秒数続いたら通知 (0 で通知しない)
+}
+
+# 設定を読み終える前でもログに残せるようにするための書き込み。
+# 非表示で自動起動したとき、起動直後の失敗は Write-Host だけだと誰にも見えない。
+function Write-EarlyLog([string]$Message, [string]$Path = "") {
+    if ($Path -eq "") { $Path = Join-Path $env:LOCALAPPDATA "GnirehtetVD\watchdog.log" }
+    Write-Host $Message
+    try {
+        $dir = Split-Path -Parent $Path
+        if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Add-Content -Path $Path -Value ("{0}  {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message) -Encoding utf8
+    } catch { }
 }
 
 # Quest 側クライアントのパッケージ名。Quest VD Wired が導入するもの。
@@ -83,12 +99,36 @@ $AndroidPackage = "com.genymobile.gnirehtet"
 
 # ---- パス自動検出 --------------------------------------------------------
 
+# 本体が使っている adb と別バージョンの adb を叩くと、adb がサーバーを
+# 再起動して reverse のマッピングが消える。なので「いま実際に使われている adb」を
+# 最優先にし、同梱のものは新しいバージョンから順に見る。
 function Find-Adb {
     $candidates = @()
 
-    # Quest VD Wired 同梱のもの (バージョン番号が変わっても拾えるようにワイルドカード)
+    # Quest VD Wired 本体 (daemon) に渡されている --adb
+    Get-CimInstance Win32_Process -Filter "Name='quest-vd-wired.exe'" -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            if ("$($_.CommandLine)" -match '--adb\s+(?:"([^"]+)"|(\S+))') {
+                $candidates += "$($Matches[1])$($Matches[2])"
+            }
+        }
+
+    # 動いている adb サーバー
+    Get-CimInstance Win32_Process -Filter "Name='adb.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { "$($_.CommandLine)" -like "*fork-server*" -and $_.ExecutablePath } |
+        ForEach-Object { $candidates += $_.ExecutablePath }
+
+    # Quest VD Wired 同梱のもの (platform-tools-<version>)。新しい順。
     $home_ = Join-Path $env:LOCALAPPDATA "GnirehtetVD"
     if (Test-Path $home_) {
+        $candidates += Get-ChildItem $home_ -Directory -Filter "platform-tools-*" -ErrorAction SilentlyContinue |
+                       Sort-Object -Descending {
+                           $v = [version]"0.0"
+                           [void][version]::TryParse(($_.Name -replace '^platform-tools-', ''), [ref]$v)
+                           $v
+                       } |
+                       ForEach-Object { Join-Path $_.FullName "platform-tools\adb.exe" }
+        # フォルダ構成が変わった場合の保険
         $candidates += Get-ChildItem $home_ -Recurse -Filter "adb.exe" -ErrorAction SilentlyContinue |
                        ForEach-Object { $_.FullName }
     }
@@ -133,8 +173,11 @@ function Read-Config {
     $cfg = [ordered]@{}
     foreach ($key in $Defaults.Keys) { $cfg[$key] = $Defaults[$key] }
 
-    if (Test-Path $ConfigPath) {
-        $json = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    # 空のファイルは「設定なし」として扱い、既定値で作り直す。
+    $raw = $null
+    if (Test-Path $ConfigPath) { $raw = Get-Content $ConfigPath -Raw -Encoding UTF8 }
+    if ("$raw".Trim() -ne "") {
+        $json = $raw | ConvertFrom-Json
         foreach ($key in @($cfg.Keys)) {
             if ($null -ne $json.$key -and "$($json.$key)" -ne "") { $cfg[$key] = $json.$key }
         }
@@ -147,7 +190,18 @@ function Read-Config {
     if ("$($cfg.adbPath)" -eq "") {
         $cfg.adbPath = Find-Adb; $created = $true
     } elseif (-not (Test-Path $cfg.adbPath)) {
-        Write-Host "設定された adbPath が見つかりません: $($cfg.adbPath)" -ForegroundColor Yellow
+        # Quest VD Wired 同梱の adb は、本体の更新で別バージョンのフォルダに
+        # 置き換わる。そこを指している値は自動検出で入ったものなので探し直してよい。
+        # (それ以外の場所は利用者が書いた値なので、上の方針どおり触らない)
+        $bundled = Join-Path $env:LOCALAPPDATA "GnirehtetVD"
+        $found = ""
+        if ("$($cfg.adbPath)".StartsWith($bundled, [StringComparison]::OrdinalIgnoreCase)) { $found = Find-Adb }
+        if ($found) {
+            Write-EarlyLog ("adbPath not found, re-detected: {0} -> {1}" -f $cfg.adbPath, $found) $cfg.logPath
+            $cfg.adbPath = $found; $created = $true
+        } else {
+            Write-Host "設定された adbPath が見つかりません: $($cfg.adbPath)" -ForegroundColor Yellow
+        }
     }
 
     if ("$($cfg.questVdWiredPath)" -eq "") {
@@ -189,16 +243,28 @@ function Test-AlreadyRunning {
 
 # 停止対象は「-File でこのスクリプト自身を実行しているループ本体」だけに絞る。
 # ファイル名だけで探すと、同名の別スクリプトを巻き添えにする。
-function Get-WatchdogProcesses {
+# -AnyLocation は別フォルダに置かれた watchdog も対象にする (更新時に、
+# Quest VD Wired の旧バージョンのフォルダ側で動いている古い watchdog を止めるため)。
+# パスの照合は -like ではなく Contains で行う ([ ] を含むパスでも一致させるため)。
+function Get-WatchdogProcesses([switch]$AnyLocation) {
+    $needle = $ScriptPath
+    if ($AnyLocation) { $needle = "\quest-vd-wired-watchdog\watchdog.ps1" }
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
         Where-Object {
+            $cl = "$($_.CommandLine)"
             $_.ProcessId -ne $PID -and
-            $_.CommandLine -like "*-File*" -and
-            $_.CommandLine -like "*$ScriptPath*" -and
-            $_.CommandLine -notlike "*-Install*" -and
-            $_.CommandLine -notlike "*-Uninstall*" -and
-            $_.CommandLine -notlike "*-Command*"
+            $cl -like "*-File*" -and
+            $cl.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+            $cl -notlike "*-Install*" -and
+            $cl -notlike "*-Uninstall*" -and
+            $cl -notlike "*-Command*"
         }
+}
+
+function Wait-MutexReleased([int]$TimeoutSec) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Test-AlreadyRunning) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+    return (-not (Test-AlreadyRunning))
 }
 
 function Install-Startup {
@@ -238,19 +304,33 @@ function Install-Startup {
     Write-Host "  $lnk"
     Write-Host ""
 
-    # 登録しただけでは今回は動かないので、その場で常駐も開始する。
+    # 更新時は古いバージョンが常駐したまま残り、次のログオンまで古いコードが
+    # 動き続ける。止めてから起動し直し、その場で新しいコードに入れ替える。
+    $replaceFailed = $false
     if (Test-AlreadyRunning) {
-        Write-Host "既に常駐しています。"
-    } else {
+        foreach ($p in @(Get-WatchdogProcesses -AnyLocation)) {
+            Write-Host "常駐中のインスタンスを停止します (pid $($p.ProcessId))"
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        if (-not (Wait-MutexReleased 10)) {
+            $replaceFailed = $true
+            Write-Host "常駐中のインスタンスを停止できませんでした。トレイアイコンを右クリック →「終了」してから、もう一度実行してください。" -ForegroundColor Red
+        }
+    }
+
+    # 登録しただけでは今回は動かないので、その場で常駐も開始する。
+    if (-not $replaceFailed) {
         $psArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$ScriptPath`"")
         if ($Show) { Start-Process powershell -ArgumentList $psArgs | Out-Null }
         else       { Start-Process powershell -ArgumentList $psArgs -WindowStyle Hidden | Out-Null }
-        Start-Sleep -Seconds 4
+        # 遅い環境では起動に数秒以上かかるので、固定で待たずに最大 15 秒見る。
+        $deadline = (Get-Date).AddSeconds(15)
+        while (-not (Test-AlreadyRunning) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
         if (Test-AlreadyRunning) {
             $p = @(Get-WatchdogProcesses)
             if ($p.Count -gt 0) { Write-Host "常駐を開始しました (pid $($p[0].ProcessId))。" }
             else                { Write-Host "常駐を開始しました。" }
-            Write-Host "タスクトレイのアイコンで状態を確認できます (緑=接続中 / 灰=未接続 / 赤=復旧中)。"
+            Write-Host "タスクトレイのアイコンで状態を確認できます (緑=接続中 / 黄=USB 未認識 / 灰=スリープ中 / 赤=復旧中)。"
         } else {
             Write-Host "常駐の開始に失敗しました。run_debug.cmd で前景実行してエラーを確認してください。" -ForegroundColor Red
         }
@@ -265,7 +345,7 @@ function Uninstall-Startup {
     else { Write-Host "not installed" }
 
     $stopped = 0
-    Get-WatchdogProcesses | ForEach-Object {
+    Get-WatchdogProcesses -AnyLocation | ForEach-Object {
         Write-Host "stopping running instance $($_.ProcessId)"
         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
         $stopped++
@@ -278,13 +358,22 @@ if ($Uninstall) { Uninstall-Startup; return }
 
 # ---- 起動時チェック ------------------------------------------------------
 
-$cfg = Read-Config
+# ここで終了するとトレイも出ないので、理由を必ずログに残す。
+try {
+    $cfg = Read-Config
+} catch {
+    Write-EarlyLog ("startup failed: cannot read {0}: {1}" -f $ConfigPath, $_.Exception.Message)
+    Write-Host "watchdog.config.json を読み込めません。内容を確認するか、削除して作り直してください。" -ForegroundColor Red
+    return
+}
 
 if ("$($cfg.adbPath)" -eq "" -or -not (Test-Path $cfg.adbPath)) {
+    Write-EarlyLog ("startup failed: adb.exe not found ({0}). Set adbPath in {1}" -f $cfg.adbPath, $ConfigPath) $cfg.logPath
     Write-Host "adb.exe が見つかりません。$ConfigPath の adbPath を設定してください。" -ForegroundColor Red
     return
 }
 if ("$($cfg.questVdWiredPath)" -eq "" -or -not (Test-Path $cfg.questVdWiredPath)) {
+    Write-EarlyLog ("startup failed: quest-vd-wired.exe not found ({0}). Set questVdWiredPath in {1}" -f $cfg.questVdWiredPath, $ConfigPath) $cfg.logPath
     Write-Host "quest-vd-wired.exe が見つかりません。$ConfigPath の questVdWiredPath を設定してください。" -ForegroundColor Red
     return
 }
@@ -324,6 +413,7 @@ $SettlePollSec = Get-IntSetting $cfg.settlePollSec   2  1
 $CmdTimeoutSec = Get-IntSetting $cfg.cmdTimeoutSec  10  2
 $MaxRestarts   = Get-IntSetting $cfg.maxRestarts     3  1
 $GiveUpWaitSec = Get-IntSetting $cfg.giveUpWaitSec 600 30
+$NotifyNoUsbSec = Get-IntSetting $cfg.notifyNoUsbSec 15 0
 
 $logDir = Split-Path -Parent $LogFile
 if ($logDir -and -not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
@@ -339,7 +429,8 @@ function Write-Log([string]$Message) {
 # ---- タスクトレイ --------------------------------------------------------
 # 常駐していることが目で分かるようにアイコンを出す。
 #   緑   = リンク健全
-#   灰   = デバイス未接続 (ケーブル / 電源 OFF)
+#   黄   = Quest が USB で見えない (ケーブル抜け / 接触不良 / 電源 OFF)
+#   灰   = USB は繋がっているが HMD がスリープ中
 #   赤   = 異常検知中・復旧作業中
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -363,6 +454,7 @@ function New-DotIcon([System.Drawing.Color]$Color) {
 $IconOk   = New-DotIcon ([System.Drawing.Color]::FromArgb(60, 190, 90))
 $IconIdle = New-DotIcon ([System.Drawing.Color]::FromArgb(150, 150, 150))
 $IconBad  = New-DotIcon ([System.Drawing.Color]::FromArgb(220, 70, 70))
+$IconNoUsb = New-DotIcon ([System.Drawing.Color]::FromArgb(235, 185, 40))
 
 $script:ForceRestart = $false
 $script:Quit         = $false
@@ -385,7 +477,12 @@ $miCfg = $menu.Items.Add("設定ファイルを開く")
 $miCfg.add_Click({ try { Start-Process notepad.exe $ConfigPath } catch { } })
 
 $miNow = $menu.Items.Add("今すぐ再接続")
-$miNow.add_Click({ $script:ForceRestart = $true })
+# 押したことは必ずログに残す。再起動中に押された場合は後で捨てられるので、
+# ここで記録しておかないと「押したのに何も起きなかった」の後追いができない。
+$miNow.add_Click({
+    Write-Log "tray: 'Reconnect now' clicked"
+    $script:ForceRestart = $true
+})
 
 $menu.Items.Add("-") | Out-Null
 
@@ -398,6 +495,7 @@ function Set-Tray([string]$State, [string]$Detail) {
     switch ($State) {
         "ok"     { $Tray.Icon = $IconOk }
         "idle"   { $Tray.Icon = $IconIdle }
+        "nousb"  { $Tray.Icon = $IconNoUsb }
         default  { $Tray.Icon = $IconBad }
     }
     # ツールチップは 63 文字までしか表示されない
@@ -405,6 +503,13 @@ function Set-Tray([string]$State, [string]$Detail) {
     if ($text.Length -gt 62) { $text = $text.Substring(0, 62) }
     $Tray.Text = $text
     $miState.Text = $Detail
+}
+
+# Windows の通知を出す (Windows 10/11 ではトースト通知として表示される)。
+function Show-Notice([string]$Title, [string]$Message, [switch]$Warning) {
+    $iconType = [System.Windows.Forms.ToolTipIcon]::Info
+    if ($Warning) { $iconType = [System.Windows.Forms.ToolTipIcon]::Warning }
+    try { $Tray.ShowBalloonTip(10000, $Title, $Message, $iconType) } catch { }
 }
 
 # Start-Sleep の代わり。待っている間もトレイ操作に反応させる。
@@ -418,7 +523,10 @@ function Wait-Tick([int]$Seconds, [switch]$IgnoreForce) {
         [System.Windows.Forms.Application]::DoEvents()
         if ($script:Quit) { return }
         if ($script:ForceRestart) {
-            if ($IgnoreForce) { $script:ForceRestart = $false }
+            if ($IgnoreForce) {
+                $script:ForceRestart = $false
+                Write-Log "  manual reconnect ignored - a restart is already in progress"
+            }
             else { return }
         }
         Start-Sleep -Milliseconds 150
@@ -440,6 +548,9 @@ Get-ChildItem $TempDir -File -ErrorAction SilentlyContinue |
 $script:TempSeq = 0
 
 function Invoke-Bounded([string]$Exe, [string[]]$Arguments, [int]$TimeoutSec) {
+    # 常駐中にストレージセンサー等が %TEMP% を掃除するとフォルダごと消える。
+    # 作り直さないとリダイレクトが毎回例外になり、監視が事実上止まる。
+    if (-not (Test-Path $TempDir)) { New-Item -ItemType Directory -Path $TempDir -Force | Out-Null }
     $script:TempSeq++
     $base = Join-Path $TempDir ("{0}-{1}" -f $PID, $script:TempSeq)
     $out = "$base.out"
@@ -459,19 +570,50 @@ function Invoke-Bounded([string]$Exe, [string[]]$Arguments, [int]$TimeoutSec) {
     }
 }
 
-function Test-DevicePresent {
+# デバイス指定付きで adb を呼ぶ。
+# 指定なしだと、ワイヤレス adb で同じ Quest が二重に見えている / エミュレータや
+# スマホが繋がっているときに "more than one device" で全コマンドが失敗し、
+# 健全なリンクを「アプリが動いていない」と誤判定して再起動を繰り返す。
+# Quest VD Wired 本体と同じく -d (USB のデバイス) を対象にする。
+function Invoke-Adb([string[]]$Arguments) {
+    return Invoke-Bounded $Adb (@("-d") + $Arguments) $CmdTimeoutSec
+}
+
+# USB で繋がっている、利用可能なデバイスの数。
+# Windows の adb は devices -l に usb: を出さないので、シリアルで見分ける。
+#   ワイヤレス  : 192.168.x.x:5555 / adb-XXXX._adb-tls-connect._tcp
+#   エミュレータ: emulator-5554
+# unauthorized / offline の行は "device" でないので数えない (未接続扱い)。
+function Get-UsbDeviceCount {
     $r = Invoke-Bounded $Adb @("devices") $CmdTimeoutSec
-    if ($r.TimedOut) { return $false }
+    if ($r.TimedOut) { return 0 }
+    $n = 0
     foreach ($line in ($r.Output -split "`r?`n")) {
-        if ($line -match "^\S+\s+device\s*$") { return $true }
+        if ($line -notmatch "^(\S+)\s+device\s*$") { continue }
+        $serial = $Matches[1]
+        if ($serial.Contains(":") -or $serial.Contains("._adb-tls") -or $serial.StartsWith("emulator-")) { continue }
+        $n++
     }
-    return $false
+    return $n
+}
+
+# HMD が起きているか。USB を挿したままスリープすると adb は "device" のまま
+# 見えるが、Quest 側のクライアントは止まる。ここで再起動しても復帰しないうえ、
+# ホストのコンソール窓が 1 分おきに出続けるので、未接続と同じく待つだけにする。
+#   mWakefulness=Awake / Asleep / Dozing / Dreaming
+function Test-HmdAwake {
+    $r = Invoke-Adb @("shell", "dumpsys", "power")
+    if ($r.TimedOut) { return $true }   # 判定できないときは起きているとみなす
+    foreach ($line in ($r.Output -split "`r?`n")) {
+        if ($line -match "mWakefulness=(\w+)") { return ($Matches[1] -eq "Awake") }
+    }
+    return $true
 }
 
 # Quest 側に VPN インターフェースがあるか。正常時は次の行が出る:
 #   29: tun0    inet 10.0.0.2/32 scope global tun0
 function Test-TunPresent {
-    $r = Invoke-Bounded $Adb @("shell", "ip", "-o", "addr") $CmdTimeoutSec
+    $r = Invoke-Adb @("shell", "ip", "-o", "addr")
     if ($r.TimedOut) { return $false }
     foreach ($line in ($r.Output -split "`r?`n")) {
         if ($line -match "\btun\d+\b" -and $line -match "\binet\b") { return $true }
@@ -483,7 +625,7 @@ function Test-TunPresent {
 # HMD の電源を入れ直すと確実に消える。tun が残るケースと違い、
 # ここが false なら一過性ではない確定的な異常。
 function Test-AndroidAppRunning {
-    $r = Invoke-Bounded $Adb @("shell", "pidof", $AndroidPackage) $CmdTimeoutSec
+    $r = Invoke-Adb @("shell", "pidof", $AndroidPackage)
     if ($r.TimedOut) { return $true }   # 判定できないときは異常と決めつけない
 
     # adb サーバーが起動していないとき、adb は PID の前に
@@ -504,14 +646,29 @@ function Test-HostRunning {
     $vdName = Split-Path -Leaf $Vd
     $p = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
            Where-Object { $_.Name -eq $vdName })
-    return ($p.Count -gt 0)
+    if ($p.Count -eq 0) { return $false }
+
+    # 本体を新しいバージョンのフォルダに入れ替えたあと、古いフォルダの本体が
+    # 動き続けていると、名前だけ見て「動いている」と判定し古い本体を使い続けてしまう。
+    # 全部が別の場所の exe なら「動いていない」とみなし、Restart-Link で入れ替える。
+    # (ExecutablePath が取れない = 管理者で動いているものは、判断できないので一致扱い)
+    $want = [System.IO.Path]::GetFullPath($Vd)
+    $other = @($p | Where-Object {
+        $_.ExecutablePath -and
+        -not [string]::Equals([System.IO.Path]::GetFullPath($_.ExecutablePath), $want, [StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($other.Count -eq $p.Count) {
+        Write-Log ("host is running from another folder ({0}) - replacing" -f $other[0].ExecutablePath)
+        return $false
+    }
+    return $true
 }
 
 # adb reverse のマッピングが張られているか。
 # マッピングは adb サーバー内に保持されるので、PC の再起動やホストプロセスの
 # 消失で失われる。読み取りのみで、接続には干渉しない。
 function Test-ReverseMappings {
-    $r = Invoke-Bounded $Adb @("reverse", "--list") $CmdTimeoutSec
+    $r = Invoke-Adb @("reverse", "--list")
     if ($r.TimedOut) { return $false }
     foreach ($line in ($r.Output -split "`r?`n")) {
         if ($line -match "tcp:\d+") { return $true }
@@ -552,7 +709,17 @@ function Restart-Link {
     # 本来の場所から起動したときと同じ作業ディレクトリにしておく。
     # exe が消えている / ドライブが外れている場合に例外で常駐ごと死なないよう握る。
     try {
-        Start-Process -FilePath $Vd -WorkingDirectory (Split-Path -Parent $Vd)
+        # quest-vd-wired.exe はコンソールサブシステムのトレイアプリで、起動直後に
+        # 自分でコンソールを手放す。Start-Process だとその一瞬だけ窓が出てしまい、
+        # 既定の端末が Windows Terminal だと前面に出ることもある。
+        # CREATE_NO_WINDOW で起動し、最初から窓を作らせない。
+        # (-NoNewWindow は watchdog 自身のコンソールを共有させるので使わない)
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName         = $Vd
+        $psi.WorkingDirectory = Split-Path -Parent $Vd
+        $psi.UseShellExecute  = $false
+        $psi.CreateNoWindow   = $true
+        [System.Diagnostics.Process]::Start($psi) | Out-Null
     } catch {
         Write-Log ("  start failed: {0}" -f $_.Exception.Message)
     }
@@ -568,6 +735,8 @@ try {
     $failures  = 0
     $restarts  = 0
     $lastState = ""
+    $noUsbSince = $null          # Quest が USB で見えなくなった時刻
+    $noUsbNotified = $false      # 今回の未接続について通知済みか
 
     Set-Tray "idle" "起動しました"
 
@@ -579,15 +748,60 @@ try {
         # プロセス操作が失敗しただけでループを抜けてしまうのを防ぐ。
         try {
 
-        if (-not (Test-DevicePresent)) {
+        $usbDevices = Get-UsbDeviceCount
+
+        # USB で見えない状態が続いたら通知する。ケーブル抜けや接触不良に
+        # 気づかないまま放置すると、Quest が充電されずに電池が切れる。
+        # 抜き差しの一瞬で鳴らないよう notifyNoUsbSec 秒続いてから出し、
+        # 1 回の未接続につき 1 回だけ。戻ったらその旨も知らせる。
+        if ($usbDevices -eq 0) {
+            if ($null -eq $noUsbSince) { $noUsbSince = Get-Date }
+            if ($NotifyNoUsbSec -gt 0 -and -not $noUsbNotified -and
+                ((Get-Date) - $noUsbSince).TotalSeconds -ge $NotifyNoUsbSec) {
+                Write-Log "notified: Quest not detected on USB"
+                Show-Notice "Quest が USB で認識されていません" `
+                    "ケーブルが抜けているか接触不良の可能性があります。この状態では Quest は充電されません。(Quest の電源が切れている場合もこの表示になります)" -Warning
+                $noUsbNotified = $true
+            }
+        } else {
+            if ($noUsbNotified) {
+                Write-Log "notified: Quest detected on USB again"
+                Show-Notice "Quest を USB で認識しました" "USB の接続が戻りました。"
+            }
+            $noUsbSince = $null
+            $noUsbNotified = $false
+        }
+
+        if ($usbDevices -gt 1) {
+            # USB のデバイスが複数あると -d が使えず、Quest VD Wired 本体も接続先を
+            # 決められない。再起動しても直らないので、警告だけ出して待つ。
+            if ($lastState -ne "multi-device") {
+                Write-Log ("{0} USB devices attached - waiting (disconnect all but the Quest)" -f $usbDevices)
+                $lastState = "multi-device"
+            }
+            Set-Tray "bad" "USB デバイスが複数 - Quest 以外を外してください"
+            $failures = 0
+            $restarts = 0
+        }
+        elseif ($usbDevices -eq 0) {
             # ケーブル接触不良 / HMD 電源 OFF。再起動しても無駄なので待つだけ。
             if ($lastState -ne "no-device") {
                 Write-Log "device not attached - waiting"
                 $lastState = "no-device"
             }
-            Set-Tray "idle" "未接続 - Quest を待機中"
+            Set-Tray "nousb" "Quest が USB で認識されていません"
             # 切断をまたいで再起動回数を持ち越すと、次の障害で 1 度も
             # 復旧を試みないまま待機に入ってしまう。ここで戻す。
+            $failures = 0
+            $restarts = 0
+        }
+        elseif (-not (Test-HmdAwake)) {
+            # USB は繋がったまま HMD がスリープ中。起きるまで待つだけ。
+            if ($lastState -ne "asleep") {
+                Write-Log "HMD asleep - waiting"
+                $lastState = "asleep"
+            }
+            Set-Tray "idle" "Quest スリープ中 - 待機中"
             $failures = 0
             $restarts = 0
         }
@@ -628,6 +842,7 @@ try {
                     Wait-Tick $GiveUpWaitSec
                     # 「今すぐ再接続」で待機を抜けた場合、フラグを消さずに
                     # continue すると次周期で二重に再起動が走る。ここで消費する。
+                    if ($script:ForceRestart) { Write-Log "  back-off ended by manual reconnect" }
                     $script:ForceRestart = $false
                     $failures = 0
                     $restarts = 0
@@ -658,6 +873,7 @@ try {
                     $lastState = "down"
                 }
                 $failures = 0
+                if ($script:ForceRestart) { Write-Log "  manual reconnect ignored - a restart just finished" }
                 $script:ForceRestart = $false
                 continue
             }
@@ -668,7 +884,7 @@ try {
         # トレイの「今すぐ再接続」
         if ($script:ForceRestart) {
             $script:ForceRestart = $false
-            Write-Log "manual restart requested from tray"
+            Write-Log "manual reconnect - restarting quest-vd-wired"
             Set-Tray "bad" "再接続中 (手動)"
             Restart-Link
             Wait-Tick 10
@@ -685,7 +901,7 @@ try {
 }
 finally {
     try { $Tray.Visible = $false; $Tray.Dispose() } catch { }
-    try { $IconOk.Dispose(); $IconIdle.Dispose(); $IconBad.Dispose() } catch { }
+    try { $IconOk.Dispose(); $IconIdle.Dispose(); $IconBad.Dispose(); $IconNoUsb.Dispose() } catch { }
     try { $mutex.ReleaseMutex() } catch { }
     try { $mutex.Dispose() } catch { }
 }
